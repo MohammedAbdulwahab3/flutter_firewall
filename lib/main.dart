@@ -1,15 +1,17 @@
-import 'dart:convert';
-
+import 'package:dns_changer/services/denylist_local_repo.dart';
+import 'package:dns_changer/services/nextdns_service.dart';
+import 'package:dns_changer/ui/denylist_page.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-
 import 'models/dns_provider.dart'
     show DNSProvider, dnsProviders, nextDnsProvider;
 import 'provider_selection_page.dart';
-import 'services/nextdns_service.dart';
+import 'package:hive_flutter/hive_flutter.dart';
 
-void main() {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await Hive.initFlutter();
+  await DenylistLocalRepo.instance.init(); // below class
   runApp(const MyApp());
 }
 
@@ -38,10 +40,8 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
-  // MethodChannel - must match Android MainActivity channel
   static const MethodChannel _platform = MethodChannel('dns_channel');
 
-  // protocol mapping constants - keep in sync with ProviderPicker on Android
   static const int QUERY_METHOD_UDP = 0;
   static const int QUERY_METHOD_TCP = 1;
   static const int QUERY_METHOD_HTTPS = 2; // DoH (IETF binary)
@@ -52,8 +52,16 @@ class _HomePageState extends State<HomePage> {
   bool _isRunning = false;
   int _currentIndex = 0;
 
-  // UI text search controller etc
   final TextEditingController _searchController = TextEditingController();
+
+  // runtime NextDNS creds (kept in-memory only — not persisted)
+  String? _nextDnsProfileId = '46bded';
+  String? _nextDnsApiKey = '5f83bcd82d612b9f0694be53eedb8e84aec7e9dd';
+
+  @override
+  void initState() {
+    super.initState();
+  }
 
   @override
   void dispose() {
@@ -67,12 +75,23 @@ class _HomePageState extends State<HomePage> {
     required int port1,
     int? port2,
   }) async {
-    final rawUpstream = provider.dns[0];
-    String upstreamArg = rawUpstream;
+    String upstreamArg = provider.dns.isNotEmpty ? provider.dns[0] : '';
 
-    if (queryMethod == QUERY_METHOD_HTTPS ||
-        queryMethod == QUERY_METHOD_HTTPS_JSON) {
-      if (!upstreamArg.contains('/')) {
+    // If provider is NextDNS and a profileId is configured, prefer profile-scoped DoH.
+    if (provider.name.toLowerCase().contains('nextdns') &&
+        _nextDnsProfileId != null &&
+        _nextDnsProfileId!.isNotEmpty) {
+      // Use official DoH endpoint from the profile: dns.nextdns.io/PROFILEID
+      upstreamArg = 'dns.nextdns.io/${_nextDnsProfileId!.trim()}';
+      queryMethod = QUERY_METHOD_HTTPS;
+    } else if (provider.doh != null && provider.doh!.isNotEmpty) {
+      // If provider has an explicit doh field (e.g. dns.nextdns.io/46bded), prefer it
+      upstreamArg = provider.doh!;
+      queryMethod = QUERY_METHOD_HTTPS;
+    } else {
+      if ((queryMethod == QUERY_METHOD_HTTPS ||
+              queryMethod == QUERY_METHOD_HTTPS_JSON) &&
+          !upstreamArg.contains('/')) {
         upstreamArg = '$upstreamArg/dns-query';
       }
     }
@@ -88,7 +107,7 @@ class _HomePageState extends State<HomePage> {
     try {
       await _platform.invokeMethod('startVpn', args);
       setState(() => _isRunning = true);
-      print('VPN started with args: $args');
+      debugPrint('VPN started with args: $args');
     } catch (e) {
       setState(() => _isRunning = false);
       if (mounted) {
@@ -99,18 +118,15 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  /// Mapping heuristics provider -> method + port (best-effort)
   Map<String, int> _mapProviderToMethodAndPort(DNSProvider p) {
     final featuresLc = p.features.map((f) => f.toLowerCase()).toList();
     final typeLc = p.type.toLowerCase();
     final nameLc = p.name.toLowerCase();
 
-    // Prefer encrypted if provider advertises "encrypted"
     if (featuresLc.any((f) => f.contains('encrypted'))) {
       return {'method': QUERY_METHOD_TLS, 'port': 853};
     }
 
-    // If features or type explicitly advertise DoH/HTTPS
     if (featuresLc.any((f) => f.contains('doh') || f.contains('https')) ||
         typeLc.contains('https') ||
         nameLc.contains('doh') ||
@@ -118,17 +134,14 @@ class _HomePageState extends State<HomePage> {
       return {'method': QUERY_METHOD_HTTPS, 'port': 443};
     }
 
-    // If features mention DoT or TLS
     if (featuresLc.any((f) => f.contains('dot') || f.contains('tls'))) {
       return {'method': QUERY_METHOD_TLS, 'port': 853};
     }
 
-    // Specific heuristics (Mullvad is encrypted-only)
     if (nameLc.contains('mullvad')) {
       return {'method': QUERY_METHOD_TLS, 'port': 853};
     }
 
-    // Default fallback to UDP
     return {'method': QUERY_METHOD_UDP, 'port': 53};
   }
 
@@ -136,14 +149,11 @@ class _HomePageState extends State<HomePage> {
     if (_isRunning) {
       try {
         await _platform.invokeMethod('stopVpn');
-      } catch (e) {
-        // ignore, but update UI
-      }
+      } catch (e) {}
       setState(() => _isRunning = false);
       return;
     }
 
-    // Starting VPN
     if (_selectedProvider == null) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Please select a DNS provider first')),
@@ -161,6 +171,91 @@ class _HomePageState extends State<HomePage> {
       port1: port,
       port2: port,
     );
+  }
+
+  Future<String?> _promptForDomain() {
+    final ctrl = TextEditingController();
+    return showDialog<String>(
+      context: context,
+      builder:
+          (ctx) => AlertDialog(
+            title: const Text('Block a domain'),
+            content: TextField(
+              controller: ctrl,
+              decoration: const InputDecoration(hintText: 'e.g. facebook.com'),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Cancel'),
+              ),
+              ElevatedButton(
+                onPressed: () {
+                  Navigator.pop(ctx, ctrl.text.trim());
+                },
+                child: const Text('Block'),
+              ),
+            ],
+          ),
+    );
+  }
+
+  Future<void> _onBlockDomainTapped() async {
+    final domain = await _promptForDomain();
+    if (domain == null || domain.isEmpty) return;
+
+    if (_nextDnsProfileId == null ||
+        _nextDnsProfileId!.isEmpty ||
+        _nextDnsApiKey == null ||
+        _nextDnsApiKey!.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Please configure NextDNS Profile ID and API Key in settings first',
+            ),
+          ),
+        );
+      }
+      return;
+    }
+
+    try {
+      await NextDnsService.addToDenylist(
+        profileId: _nextDnsProfileId!.trim(),
+        apiKey: _nextDnsApiKey!.trim(),
+        domain: domain,
+      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Added $domain to NextDNS denylist')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Failed to add $domain: $e')));
+      }
+      return;
+    }
+
+    // ensure profile is selected and restart VPN to apply immediately (your existing logic)
+    if (_selectedProvider?.name != nextDnsProvider.name) {
+      setState(() => _selectedProvider = nextDnsProvider);
+    }
+    if (_isRunning) {
+      try {
+        await _platform.invokeMethod('stopVpn');
+      } catch (_) {}
+      final mapping = _mapProviderToMethodAndPort(nextDnsProvider);
+      await _startVpnForProvider(
+        provider: nextDnsProvider,
+        queryMethod: mapping['method']!,
+        port1: mapping['port']!,
+        port2: mapping['port']!,
+      );
+    }
   }
 
   Future<void> _goToSelection() async {
@@ -190,67 +285,54 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  Future<String?> _promptForDomain() {
-    final ctrl = TextEditingController();
-    return showDialog<String>(
+  Future<void> _showNextDnsConfigDialog() async {
+    final pidCtrl = TextEditingController(text: _nextDnsProfileId ?? '');
+    final keyCtrl = TextEditingController(text: _nextDnsApiKey ?? '');
+    final res = await showDialog<bool>(
       context: context,
       builder:
           (ctx) => AlertDialog(
-            title: const Text('Block a domain'),
-            content: TextField(
-              controller: ctrl,
-              decoration: const InputDecoration(hintText: 'e.g. facebook.com'),
+            title: const Text('NextDNS Configuration'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: pidCtrl,
+                  decoration: const InputDecoration(labelText: 'Profile ID'),
+                ),
+                TextField(
+                  controller: keyCtrl,
+                  decoration: const InputDecoration(labelText: 'API Key'),
+                ),
+                const SizedBox(height: 8),
+                const Text(
+                  'Find profile id and API key at https://my.nextdns.io (Endpoints / Account)',
+                ),
+              ],
             ),
             actions: [
               TextButton(
-                onPressed: () => Navigator.pop(ctx),
+                onPressed: () => Navigator.pop(ctx, false),
                 child: const Text('Cancel'),
               ),
               ElevatedButton(
-                onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
-                child: const Text('Block'),
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text('Save'),
               ),
             ],
           ),
     );
-  }
 
-  Future<void> _onBlockDomainTapped() async {
-    final domain = await _promptForDomain();
-    if (domain == null || domain.isEmpty) return;
-
-    try {
-      await NextDnsService.addToDenylist(domain);
+    if (res == true) {
+      setState(() {
+        _nextDnsProfileId = pidCtrl.text.trim();
+        _nextDnsApiKey = keyCtrl.text.trim();
+      });
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Added $domain to NextDNS denylist')),
+          const SnackBar(content: Text('NextDNS credentials set (in-memory)')),
         );
       }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('Failed to add $domain: $e')));
-      }
-      return;
-    }
-
-    // switch to NextDNS if not already
-    if (_selectedProvider?.name != nextDnsProvider.name) {
-      setState(() => _selectedProvider = nextDnsProvider);
-    }
-    if (_isRunning) {
-      // restart VPN to apply NextDNS
-      try {
-        await _platform.invokeMethod('stopVpn');
-      } catch (_) {}
-      final mapping = _mapProviderToMethodAndPort(nextDnsProvider);
-      await _startVpnForProvider(
-        provider: nextDnsProvider,
-        queryMethod: mapping['method']!,
-        port1: mapping['port']!,
-        port2: mapping['port']!,
-      );
     }
   }
 
@@ -263,6 +345,13 @@ class _HomePageState extends State<HomePage> {
       appBar: AppBar(
         title: const Text('Shield Guard – IPv4 & IPv6'),
         centerTitle: true,
+        actions: [
+          IconButton(
+            tooltip: 'NextDNS settings',
+            icon: const Icon(Icons.settings),
+            onPressed: _showNextDnsConfigDialog,
+          ),
+        ],
       ),
       drawer: Drawer(
         child: ListView(
@@ -275,30 +364,6 @@ class _HomePageState extends State<HomePage> {
                 style: TextStyle(color: Colors.white, fontSize: 32),
               ),
             ),
-            ...[
-              {'icon': Icons.public, 'label': 'Network Info', 'action': () {}},
-              {
-                'icon': Icons.add_to_home_screen,
-                'label': 'Add Custom DNS',
-                'action': () {},
-              },
-              {'icon': Icons.search, 'label': 'DNS Lookup', 'action': () {}},
-              {'icon': Icons.settings, 'label': 'Settings', 'action': () {}},
-            ].map(
-              (item) => ListTile(
-                leading: Icon(item['icon'] as IconData, color: Colors.white),
-                title: Text(
-                  item['label'] as String,
-                  style: const TextStyle(color: Colors.white),
-                ),
-                onTap: item['action'] as VoidCallback,
-              ),
-            ),
-            const Divider(color: Colors.grey),
-            const Padding(
-              padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              child: Text('Support', style: TextStyle(color: Colors.grey)),
-            ),
             ListTile(
               leading: const Icon(Icons.block, color: Colors.white),
               title: const Text(
@@ -310,6 +375,42 @@ class _HomePageState extends State<HomePage> {
                 _onBlockDomainTapped();
               },
             ),
+            ListTile(
+              leading: const Icon(Icons.cloud, color: Colors.white),
+              title: const Text(
+                'NextDNS Config',
+                style: TextStyle(color: Colors.white),
+              ),
+              subtitle: Text(
+                _nextDnsProfileId ?? 'Not configured',
+                style: const TextStyle(color: Colors.white70),
+              ),
+              onTap: () {
+                Navigator.pop(context);
+                _showNextDnsConfigDialog();
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.filter_list_alt, color: Colors.white),
+              title: const Text(
+                'NextDNS denaylist',
+                style: TextStyle(color: Colors.red),
+              ),
+
+              onTap: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder:
+                        (_) => DenylistPage(
+                          profileId: _nextDnsProfileId!,
+                          apiKey: _nextDnsApiKey!,
+                        ),
+                  ),
+                );
+              },
+            ),
+            const Divider(color: Colors.grey),
             ...[
               {'icon': Icons.share, 'label': 'Share this app'},
               {'icon': Icons.feedback, 'label': 'Send Feedback'},

@@ -138,53 +138,100 @@ class UdpProvider(
         val ip = try {
             IpSelector.newPacket(packetData, 0, packetData.size) as IpPacket
         } catch (e: Exception) { return }
-
+    
         val udp = ip.payload as? UdpPacket ?: return
-
+    
         val dstPort = try { udp.header.dstPort.valueAsInt() } catch (e: Exception) { return }
-        if (dstPort != 53) return
-
+    
         val raw = udp.payload?.rawData ?: return
-
-        val dnsMsg = try { DnsMessage(raw) } catch (e: Exception) { return }
-        val question = try { dnsMsg.question } catch (e: Exception) { return }
-        if (question == null) return
-
-        try { Log.d("UdpProvider", "DNS query for: ${question.name} type=${question.type}") } catch (_: Exception) {}
-
-        if (service.resolveLocal(ip, dnsMsg)) return
-
-        if (shouldBlock(dnsMsg)) {
-            Log.i("UdpProvider", "Blocked DNS: ${question.name}")
-            try {
-                val nx = raw.copyOf()
-                val flags = 0x8003
-                nx[2] = ((flags shr 8) and 0xFF).toByte()
-                nx[3] = (flags and 0xFF).toByte()
-                handleDnsResponse(ip, nx)
-            } catch (e: Exception) {
-                Log.w("UdpProvider", "Craft NX failed: ${e.message}")
+    
+        val dnsMsg = try { DnsMessage(raw) } catch (e: Exception) { /* not DNS payload, still attempt forwarding below */ null }
+    
+        val question = try { dnsMsg?.question } catch (e: Exception) { null }
+    
+        // If it's a DNS query (UDP port 53), handle using existing DNS logic (blocklist, DoH forwarding, etc.)
+        if (dstPort == 53 && question != null) {
+            try { Log.d("UdpProvider", "DNS query for: ${question.name} type=${question.type}") } catch (_: Exception) {}
+    
+            if (service.resolveLocal(ip, dnsMsg!!)) return
+    
+            if (shouldBlock(dnsMsg)) {
+                Log.i("UdpProvider", "Blocked DNS: ${question.name}")
+                try {
+                    val nx = raw.copyOf()
+                    val flags = 0x8003
+                    nx[2] = ((flags shr 8) and 0xFF).toByte()
+                    nx[3] = (flags and 0xFF).toByte()
+                    handleDnsResponse(ip, nx)
+                } catch (e: Exception) {
+                    Log.w("UdpProvider", "Craft NX failed: ${e.message}")
+                }
+                return
             }
+    
+            // Existing DNS forwarding over UDP to upstream1 (same as before)
+            try {
+                val sock = DatagramSocket()
+                val protected = try { service.protect(sock) } catch (ex: Exception) { Log.w("UdpProvider","protect threw: ${ex.message}"); false }
+                if (!protected) {
+                    Log.e("UdpProvider", "Failed to protect socket — replies won't be delivered. Closing socket.")
+                    try { sock.close() } catch (_: Exception) {}
+                    return
+                }
+    
+                sock.soTimeout = 0
+                val addr = InetAddress.getByName(service.upstream1)
+                val out = DatagramPacket(raw, raw.size, addr, service.port1)
+    
+                Log.d("UdpProvider", "Sending DNS query to ${addr.hostAddress}:${service.port1} for ${question.name}")
+                sock.send(out)
+                Log.d("UdpProvider", "Sent packet (length=${out.length}) to ${addr.hostAddress}:${service.port1}")
+    
+                val pfd = try {
+                    ParcelFileDescriptor.fromDatagramSocket(sock)
+                } catch (e: Exception) {
+                    Log.w("UdpProvider", "fromDatagramSocket failed: ${e.message}")
+                    try { sock.close() } catch (_: Exception) {}
+                    return
+                }
+    
+                val sp = StructPollfd().apply {
+                    fd = pfd.fileDescriptor
+                    events = OsConstants.POLLIN.toShort()
+                    revents = 0
+                }
+    
+                dnsIn.add(WaitingOnSocketPacket(sock, ip, pfd, sp))
+            } catch (e: Exception) {
+                Log.w("UdpProvider", "Forward error: ${e.message}")
+            }
+    
             return
         }
-
+    
+        // ---------- Non-DNS UDP forwarding (NEW) ----------
+        // For UDP packets not destined to port 53, forward payload using a protected DatagramSocket.
         try {
             val sock = DatagramSocket()
             val protected = try { service.protect(sock) } catch (ex: Exception) { Log.w("UdpProvider","protect threw: ${ex.message}"); false }
             if (!protected) {
-                Log.e("UdpProvider", "Failed to protect socket — replies won't be delivered. Closing socket.")
+                Log.e("UdpProvider", "Failed to protect socket for UDP forwarding. Closing socket.")
                 try { sock.close() } catch (_: Exception) {}
                 return
             }
-
+    
             sock.soTimeout = 0
-            val addr = InetAddress.getByName(service.upstream1)
-            val out = DatagramPacket(raw, raw.size, addr, service.port1)
-
-            Log.d("UdpProvider", "Sending DNS query to ${addr.hostAddress}:${service.port1} for ${question.name}")
+    
+            val dstAddr = when (ip) {
+                is org.pcap4j.packet.IpV4Packet -> ip.header.dstAddr as InetAddress
+                is org.pcap4j.packet.IpV6Packet -> ip.header.dstAddr as InetAddress
+                else -> null
+            } ?: return
+    
+            val out = DatagramPacket(raw, raw.size, dstAddr, dstPort)
+            Log.d("UdpProvider", "Forwarding UDP to ${dstAddr.hostAddress}:$dstPort (len=${raw.size})")
             sock.send(out)
-            Log.d("UdpProvider", "Sent packet (length=${out.length}) to ${addr.hostAddress}:${service.port1}")
-
+    
             val pfd = try {
                 ParcelFileDescriptor.fromDatagramSocket(sock)
             } catch (e: Exception) {
@@ -192,18 +239,92 @@ class UdpProvider(
                 try { sock.close() } catch (_: Exception) {}
                 return
             }
-
+    
             val sp = StructPollfd().apply {
                 fd = pfd.fileDescriptor
                 events = OsConstants.POLLIN.toShort()
                 revents = 0
             }
-
+    
+            // Reuse WaitingOnSocketPacket to capture the reply and map it back to the original IP packet.
             dnsIn.add(WaitingOnSocketPacket(sock, ip, pfd, sp))
         } catch (e: Exception) {
-            Log.w("UdpProvider", "Forward error: ${e.message}")
+            Log.w("UdpProvider", "UDP forward error: ${e.message}")
         }
     }
+    
+
+
+    // override fun handleDnsRequest(packetData: ByteArray) {
+    //     val ip = try {
+    //         IpSelector.newPacket(packetData, 0, packetData.size) as IpPacket
+    //     } catch (e: Exception) { return }
+
+    //     val udp = ip.payload as? UdpPacket ?: return
+
+    //     val dstPort = try { udp.header.dstPort.valueAsInt() } catch (e: Exception) { return }
+    //     if (dstPort != 53) return
+
+    //     val raw = udp.payload?.rawData ?: return
+
+    //     val dnsMsg = try { DnsMessage(raw) } catch (e: Exception) { return }
+    //     val question = try { dnsMsg.question } catch (e: Exception) { return }
+    //     if (question == null) return
+
+    //     try { Log.d("UdpProvider", "DNS query for: ${question.name} type=${question.type}") } catch (_: Exception) {}
+
+    //     if (service.resolveLocal(ip, dnsMsg)) return
+
+    //     if (shouldBlock(dnsMsg)) {
+    //         Log.i("UdpProvider", "Blocked DNS: ${question.name}")
+    //         try {
+    //             val nx = raw.copyOf()
+    //             val flags = 0x8003
+    //             nx[2] = ((flags shr 8) and 0xFF).toByte()
+    //             nx[3] = (flags and 0xFF).toByte()
+    //             handleDnsResponse(ip, nx)
+    //         } catch (e: Exception) {
+    //             Log.w("UdpProvider", "Craft NX failed: ${e.message}")
+    //         }
+    //         return
+    //     }
+
+    //     try {
+    //         val sock = DatagramSocket()
+    //         val protected = try { service.protect(sock) } catch (ex: Exception) { Log.w("UdpProvider","protect threw: ${ex.message}"); false }
+    //         if (!protected) {
+    //             Log.e("UdpProvider", "Failed to protect socket — replies won't be delivered. Closing socket.")
+    //             try { sock.close() } catch (_: Exception) {}
+    //             return
+    //         }
+
+    //         sock.soTimeout = 0
+    //         val addr = InetAddress.getByName(service.upstream1)
+    //         val out = DatagramPacket(raw, raw.size, addr, service.port1)
+
+    //         Log.d("UdpProvider", "Sending DNS query to ${addr.hostAddress}:${service.port1} for ${question.name}")
+    //         sock.send(out)
+    //         Log.d("UdpProvider", "Sent packet (length=${out.length}) to ${addr.hostAddress}:${service.port1}")
+
+    //         val pfd = try {
+    //             ParcelFileDescriptor.fromDatagramSocket(sock)
+    //         } catch (e: Exception) {
+    //             Log.w("UdpProvider", "fromDatagramSocket failed: ${e.message}")
+    //             try { sock.close() } catch (_: Exception) {}
+    //             return
+    //         }
+
+    //         val sp = StructPollfd().apply {
+    //             fd = pfd.fileDescriptor
+    //             events = OsConstants.POLLIN.toShort()
+    //             revents = 0
+    //         }
+
+    //         dnsIn.add(WaitingOnSocketPacket(sock, ip, pfd, sp))
+    //     } catch (e: Exception) {
+    //         Log.w("UdpProvider", "Forward error: ${e.message}")
+    //     }
+    // }
 
     private fun handleRawDnsResponse(w: WaitingOnSocketPacket) {
         try {

@@ -1,103 +1,200 @@
-// // lib/services/nextdns_service.dart
-
-// import 'dart:convert';
-// import 'package:http/http.dart' as http;
-
-// const _profileId = 'd4c36a';
-// const _apiKey = 'YOUR_NEXTDNS_API_KEY';
-
-// class NextDnsService {
-//   /// Throws on any non-204 response, with status+body.
-//   static Future<void> addToDenylist(String domain) async {
-//     final uri = Uri.https('api.nextdns.io', '/profiles/$_profileId/denylist');
-//     final resp = await http.post(
-//       uri,
-//       headers: {
-//         'Authorization': 'Bearer $_apiKey',
-//         'Content-Type': 'application/json',
-//       },
-//       body: jsonEncode({'domain': domain}),
-//     );
-
-//     if (resp.statusCode != 204) {
-//       throw Exception(
-//         'API ${resp.statusCode}: ${resp.body.isEmpty ? '<no body>' : resp.body}',
-//       );
-//     }
-//   }
-// // }
-
-// import 'dart:convert';
-// import 'package:http/http.dart' as http;
-
-// class NextDnsService {
-//   static const String _profileId =
-//       '46bded'; // Replace with your actual profile ID
-//   static const String _apiKey =
-//       '5f83bcd82d612b9f0694be53eedb8e84aec7e9dd'; // Replace with your actual API Key
-//   // Base URL for NextDNS API
-//   static const String _baseUrl = 'https://api.nextdns.io';
-
-//   /// Adds a domain to the denylist
-//   static Future<void> addToDenylist(String domain) async {
-//     final url = Uri.parse('$_baseUrl/profiles/$_profileId/');
-
-//     final denylist =
-//         domains.map((domain) => {"id": domain, "active": true}).toList();
-
-//     final body = jsonEncode({"denylist": denylist});
-
-//     final response = await http.post(
-//       url,
-//       headers: {'Content-Type': 'application/json', 'X-API-Key': _apiKey},
-//       body: body,
-//     );
-
-//     if (response.statusCode == 200 || response.statusCode == 201) {
-//       // Successfully added
-//       print('✅ Domain added: $domain');
-//     } else {
-//       // Something went wrong
-//       final error = jsonDecode(response.body);
-//       throw Exception('Failed to add domain: $error');
-//     }
-//   }
-// }
-
 import 'dart:convert';
 import 'package:http/http.dart' as http;
-import 'package:http/http.dart' as https;
+import 'denylist_local_repo.dart';
 
 class NextDnsService {
-  static const String _profileId =
-      '46bded'; // Replace with your actual profile ID
-  static const String _apiKey =
-      '5f83bcd82d612b9f0694be53eedb8e84aec7e9dd'; // Replace with your actual API Key
-  static const String _baseUrl = 'https://api.nextdns.io';
-
-  /// Adds a single domain to the denylist
-  static Future<void> addToDenylist(String domain) async {
-    final url = Uri.parse('$_baseUrl/profiles/$_profileId/');
-
-    // Build the denylist with the single domain
-    final denylist = [
-      {"id": domain, "active": true},
-    ];
-
-    final body = jsonEncode({"denylist": denylist});
-
-    final response = await http.patch(
+  /// Get the current denylist from NextDNS profile as a list of domain strings.
+  static Future<List<String>> getDenylist({
+    required String profileId,
+    required String apiKey,
+  }) async {
+    final url = Uri.parse('https://api.nextdns.io/profiles/$profileId/');
+    final resp = await http.get(
       url,
-      headers: {'Content-Type': 'application/json', 'X-API-Key': _apiKey},
-      body: body,
+      headers: {'X-Api-Key': apiKey, 'Accept': 'application/json'},
+    );
+    if (resp.statusCode < 200 || resp.statusCode >= 300) {
+      throw Exception('NextDNS GET failed ${resp.statusCode}: ${resp.body}');
+    }
+    if (resp.body.isEmpty) return <String>[];
+    final Map<String, dynamic> profile =
+        jsonDecode(resp.body) as Map<String, dynamic>;
+    final List<dynamic> raw =
+        (profile['denylist'] is List)
+            ? List<dynamic>.from(profile['denylist'])
+            : <dynamic>[];
+    final List<String> result = [];
+    for (final e in raw) {
+      if (e is String)
+        result.add(e.toLowerCase());
+      else if (e is Map && e['id'] != null)
+        result.add((e['id'] as String).toLowerCase());
+    }
+    // update local cache
+    await DenylistLocalRepo.instance.saveAll(result);
+    return result;
+  }
+
+  /// Add a single domain to the profile denylist (server-side) and update local repo.
+  static Future<void> addToDenylist({
+    required String profileId,
+    required String apiKey,
+    required String domain,
+  }) async {
+    final normalized = domain.trim().toLowerCase();
+    if (normalized.isEmpty) throw Exception('Domain is empty');
+
+    final url = Uri.parse('https://api.nextdns.io/profiles/$profileId/');
+
+    // GET existing
+    final getResp = await http.get(
+      url,
+      headers: {'X-Api-Key': apiKey, 'Accept': 'application/json'},
+    );
+    if (getResp.statusCode < 200 || getResp.statusCode >= 300) {
+      throw Exception(
+        'NextDNS GET failed ${getResp.statusCode}: ${getResp.body}',
+      );
+    }
+
+    // Parse existing denylist into object list form
+    final Map<String, dynamic> profile =
+        getResp.body.isNotEmpty
+            ? jsonDecode(getResp.body) as Map<String, dynamic>
+            : {};
+    final List<dynamic> raw =
+        (profile['denylist'] is List)
+            ? List<dynamic>.from(profile['denylist'])
+            : <dynamic>[];
+
+    // Normalize and detect duplicates
+    final Set<String> ids = {};
+    final List<Map<String, dynamic>> merged = [];
+    for (final e in raw) {
+      if (e is String) {
+        ids.add(e.toLowerCase());
+        merged.add({'id': e.toLowerCase(), 'active': true});
+      } else if (e is Map) {
+        final id = (e['id'] ?? '').toString().toLowerCase();
+        if (id.isNotEmpty && !ids.contains(id)) {
+          ids.add(id);
+          merged.add({'id': id, 'active': e['active'] == true});
+        }
+      }
+    }
+
+    if (ids.contains(normalized)) {
+      // already present -> update local repo and exit
+      final local = merged.map((m) => m['id'] as String).toList();
+      await DenylistLocalRepo.instance.saveAll(local);
+      return;
+    }
+
+    merged.add({'id': normalized, 'active': true});
+
+    // PATCH only `denylist` field (object list)
+    final patchBody = jsonEncode({'denylist': merged});
+    final patchResp = await http.patch(
+      url,
+      headers: {'X-Api-Key': apiKey, 'Content-Type': 'application/json'},
+      body: patchBody,
     );
 
-    if (response.statusCode == 204 || response.statusCode == 201) {
-      print('✅ Domain added: $domain');
-    } else {
-      final error = jsonDecode(response.body);
-      throw Exception('❌ Failed to add domain: $error');
-      print(error);
+    if (patchResp.statusCode < 200 || patchResp.statusCode >= 300) {
+      throw Exception(
+        'NextDNS PATCH failed ${patchResp.statusCode}: ${patchResp.body}',
+      );
     }
+
+    // update local
+    final updatedLocal = merged.map((m) => (m['id'] as String)).toList();
+    await DenylistLocalRepo.instance.saveAll(updatedLocal);
+  }
+
+  /// Remove a domain from the profile denylist (server-side) and update local repo.
+  static Future<void> removeFromDenylist({
+    required String profileId,
+    required String apiKey,
+    required String domain,
+  }) async {
+    final normalized = domain.trim().toLowerCase();
+    if (normalized.isEmpty) throw Exception('Domain is empty');
+
+    final url = Uri.parse('https://api.nextdns.io/profiles/$profileId/');
+    final getResp = await http.get(
+      url,
+      headers: {'X-Api-Key': apiKey, 'Accept': 'application/json'},
+    );
+    if (getResp.statusCode < 200 || getResp.statusCode >= 300) {
+      throw Exception(
+        'NextDNS GET failed ${getResp.statusCode}: ${getResp.body}',
+      );
+    }
+
+    final Map<String, dynamic> profile =
+        getResp.body.isNotEmpty
+            ? jsonDecode(getResp.body) as Map<String, dynamic>
+            : {};
+    final List<dynamic> raw =
+        (profile['denylist'] is List)
+            ? List<dynamic>.from(profile['denylist'])
+            : <dynamic>[];
+
+    final List<Map<String, dynamic>> merged = [];
+    for (final e in raw) {
+      if (e is String) {
+        final id = e.toLowerCase();
+        if (id != normalized) merged.add({'id': id, 'active': true});
+      } else if (e is Map) {
+        final id = (e['id'] ?? '').toString().toLowerCase();
+        if (id.isNotEmpty && id != normalized)
+          merged.add({'id': id, 'active': e['active'] == true});
+      }
+    }
+
+    final patchBody = jsonEncode({'denylist': merged});
+    final patchResp = await http.patch(
+      url,
+      headers: {'X-Api-Key': apiKey, 'Content-Type': 'application/json'},
+      body: patchBody,
+    );
+
+    if (patchResp.statusCode < 200 || patchResp.statusCode >= 300) {
+      throw Exception(
+        'NextDNS PATCH failed ${patchResp.statusCode}: ${patchResp.body}',
+      );
+    }
+
+    // update local
+    final local = merged.map((m) => (m['id'] as String)).toList();
+    await DenylistLocalRepo.instance.saveAll(local);
+  }
+
+  /// Sync local repo -> remote, merging (use if you allowed local-only edits offline)
+  static Future<void> syncLocalToRemote({
+    required String profileId,
+    required String apiKey,
+  }) async {
+    final local = DenylistLocalRepo.instance.getAll();
+    final remote = await getDenylist(profileId: profileId, apiKey: apiKey);
+    // merge sets (remote wins for duplication, just combine)
+    final mergedSet = <String>{};
+    mergedSet.addAll(remote.map((e) => e.toLowerCase()));
+    mergedSet.addAll(local.map((e) => e.toLowerCase()));
+    final mergedList = mergedSet.map((s) => {'id': s, 'active': true}).toList();
+    final url = Uri.parse('https://api.nextdns.io/profiles/$profileId/');
+    final patchResp = await http.patch(
+      url,
+      headers: {'X-Api-Key': apiKey, 'Content-Type': 'application/json'},
+      body: jsonEncode({'denylist': mergedList}),
+    );
+    if (patchResp.statusCode < 200 || patchResp.statusCode >= 300) {
+      throw Exception(
+        'NextDNS PATCH failed ${patchResp.statusCode}: ${patchResp.body}',
+      );
+    }
+    await DenylistLocalRepo.instance.saveAll(
+      mergedList.map((m) => m['id'] as String).toList(),
+    );
   }
 }

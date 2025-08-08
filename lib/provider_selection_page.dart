@@ -1,4 +1,4 @@
-// lib/provider_selection_page.dart
+// File: lib/provider_selection_page.dart
 import 'package:flutter/material.dart';
 import 'models/dns_provider.dart';
 
@@ -113,6 +113,20 @@ class _ProviderSelectionPageState extends State<ProviderSelectionPage> {
                         color: Colors.white,
                         fontFamily: 'monospace',
                       ),
+                    ),
+                  ),
+                ),
+              ],
+              if (provider.doh != null) ...[
+                const SizedBox(height: 12),
+                Text('DoH / DoH host', style: TextStyle(color: kAccentColor)),
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 2),
+                  child: Text(
+                    provider.doh!,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontFamily: 'monospace',
                     ),
                   ),
                 ),
@@ -235,7 +249,6 @@ class _ProviderSelectionPageState extends State<ProviderSelectionPage> {
                 vertical: 8,
               ),
               children: [
-                // ADD THIS at the END of the children list
                 Align(
                   alignment: Alignment.centerRight,
                   child: ElevatedButton.icon(
@@ -257,7 +270,7 @@ class _ProviderSelectionPageState extends State<ProviderSelectionPage> {
                   ),
                 ),
                 const SizedBox(height: 12),
-              ], // details moved into the bottom sheet
+              ],
             ),
           );
         },
