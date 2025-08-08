@@ -1,3 +1,4 @@
+import 'package:dns_changer/admin_page.dart';
 import 'package:dns_changer/services/denylist_local_repo.dart';
 import 'package:dns_changer/services/nextdns_service.dart';
 import 'package:dns_changer/ui/denylist_page.dart';
@@ -364,17 +365,29 @@ class _HomePageState extends State<HomePage> {
                 style: TextStyle(color: Colors.white, fontSize: 32),
               ),
             ),
+            // ListTile(
+            //   leading: const Icon(Icons.block, color: Colors.white),
+            //   title: const Text(
+            //     'Block a Site',
+            //     style: TextStyle(color: Colors.white),
+            //   ),
+            //   onTap: () {
+            //     Navigator.pop(context);
+            //     _onBlockDomainTapped();
+            //   },
+            // ),
             ListTile(
-              leading: const Icon(Icons.block, color: Colors.white),
-              title: const Text(
-                'Block a Site',
-                style: TextStyle(color: Colors.white),
-              ),
+              leading: const Icon(Icons.cloud, color: Colors.white),
+              title: const Text('Admin', style: TextStyle(color: Colors.white)),
+
               onTap: () {
-                Navigator.pop(context);
-                _onBlockDomainTapped();
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (_) => AdminPage()),
+                );
               },
             ),
+
             ListTile(
               leading: const Icon(Icons.cloud, color: Colors.white),
               title: const Text(
@@ -391,10 +404,10 @@ class _HomePageState extends State<HomePage> {
               },
             ),
             ListTile(
-              leading: const Icon(Icons.filter_list_alt, color: Colors.white),
+              leading: const Icon(Icons.block, color: Colors.white),
               title: const Text(
-                'NextDNS denaylist',
-                style: TextStyle(color: Colors.red),
+                'Add Denaylist',
+                style: TextStyle(color: Colors.white),
               ),
 
               onTap: () {

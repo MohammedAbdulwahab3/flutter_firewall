@@ -1,9 +1,11 @@
-// MainActivity.kt
 package com.example.dns_changer
 
 import android.app.Activity
+import android.app.admin.DevicePolicyManager
+import android.content.ComponentName
 import android.content.Intent
 import android.net.VpnService
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import androidx.annotation.NonNull
@@ -28,8 +30,6 @@ class MainActivity : FlutterActivity() {
           pendingDns1 = call.argument<String>("dns1") ?: ""
           pendingDns2 = call.argument<String>("dns2") ?: pendingDns1
 
-          // Read optional queryMethod (int) and port overrides
-          // Expected mapping: 0=UDP, 1=TCP, 2=HTTPS(DoH binary), 3=TLS(DoT), 4=HTTPS_JSON
           pendingQueryMethod = when (val qm = call.argument<Any>("queryMethod")) {
             is Int -> qm
             is Long -> qm.toInt()
@@ -54,22 +54,92 @@ class MainActivity : FlutterActivity() {
         "stopVpn" -> {
           Intent(this, DnsVpnService::class.java).apply {
             action = DnsVpnService.ACTION_STOP
-          }.also(::startService)
+          }.also { intent ->
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent) else startService(intent)
+          }
           result.success(null)
         }
+
+        // Admin related methods
+        "isDeviceOwner" -> {
+          val dpm = getSystemService(DevicePolicyManager::class.java)
+          result.success(dpm.isDeviceOwnerApp(packageName))
+        }
+
+        "requestDeviceAdmin" -> {
+          // Launch the legacy admin activation screen (not device owner)
+          val admin = ComponentName(this, DeviceAdminReceiver::class.java)
+          val intent = Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN).apply {
+            putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, admin)
+            putExtra(DevicePolicyManager.EXTRA_ADD_EXPLANATION, "Device admin required for enterprise features")
+          }
+          startActivity(intent)
+          result.success(null)
+        }
+
+        "enableAlwaysOnVpn" -> {
+          try {
+            val admin = ComponentName(this, DeviceAdminReceiver::class.java)
+            val dpm = getSystemService(DevicePolicyManager::class.java)
+            if (dpm.isDeviceOwnerApp(packageName)) {
+              // setAlwaysOnVpnPackage(admin, vpnPackage, lockdown, lockdownAllowedPackages)
+              dpm.setAlwaysOnVpnPackage(admin, packageName, true, null)
+              result.success(true)
+            } else result.error("NOT_OWNER", "App is not device owner", null)
+          } catch (e: Exception) {
+            result.error("ERR", e.message, null)
+          }
+        }
+
+        "disableAlwaysOnVpn" -> {
+          try {
+            val admin = ComponentName(this, DeviceAdminReceiver::class.java)
+            val dpm = getSystemService(DevicePolicyManager::class.java)
+            if (dpm.isDeviceOwnerApp(packageName)) {
+              dpm.setAlwaysOnVpnPackage(admin, null, false, null)
+              result.success(true)
+            } else result.error("NOT_OWNER", "App is not device owner", null)
+          } catch (e: Exception) {
+            result.error("ERR", e.message, null)
+          }
+        }
+
+        "blockUninstall" -> {
+          try {
+            val admin = ComponentName(this, DeviceAdminReceiver::class.java)
+            val dpm = getSystemService(DevicePolicyManager::class.java)
+            if (dpm.isDeviceOwnerApp(packageName)) {
+              dpm.setUninstallBlocked(admin, packageName, true)
+              result.success(true)
+            } else result.error("NOT_OWNER", "App is not device owner", null)
+          } catch (e: Exception) {
+            result.error("ERR", e.message, null)
+          }
+        }
+
+        "unblockUninstall" -> {
+          try {
+            val admin = ComponentName(this, DeviceAdminReceiver::class.java)
+            val dpm = getSystemService(DevicePolicyManager::class.java)
+            if (dpm.isDeviceOwnerApp(packageName)) {
+              dpm.setUninstallBlocked(admin, packageName, false)
+              result.success(true)
+            } else result.error("NOT_OWNER", "App is not device owner", null)
+          } catch (e: Exception) {
+            result.error("ERR", e.message, null)
+          }
+        }
+
         else -> result.notImplemented()
       }
     }
   }
 
   private fun prepareVpn() {
-    // VpnService.prepare returns an Intent? when null, permission already granted.
     val vpnIntent: Intent? = VpnService.prepare(this)
     if (vpnIntent != null) {
-      // permission needed
       startActivityForResult(vpnIntent, VPN_REQUEST)
     } else {
-      // already have permission, proceed
       onActivityResult(VPN_REQUEST, Activity.RESULT_OK, null)
     }
   }
@@ -77,14 +147,19 @@ class MainActivity : FlutterActivity() {
   override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
     super.onActivityResult(requestCode, resultCode, data)
     if (requestCode == VPN_REQUEST && resultCode == Activity.RESULT_OK) {
-      Intent(this, DnsVpnService::class.java).apply {
+      val svcIntent = Intent(this, DnsVpnService::class.java).apply {
         action = DnsVpnService.ACTION_START
         putExtra("dns1", pendingDns1)
         putExtra("dns2", pendingDns2)
         putExtra("queryMethod", pendingQueryMethod)
         putExtra("port1", pendingPort1)
         putExtra("port2", pendingPort2)
-      }.also(::startService)
+      }
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        startForegroundService(svcIntent)
+      } else {
+        startService(svcIntent)
+      }
     } else {
       Log.e("MainActivity", "VPN permission denied or wrong requestCode")
     }

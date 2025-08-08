@@ -20,7 +20,7 @@ class DNSProvider {
 
 /// NextDNS profile (example: 46bded)
 const DNSProvider nextDnsProvider = DNSProvider(
-  name: 'NextDNS',
+  name: 'MyDNS',
   type: 'Plain DNS Anycast',
   dns: [
     '45.90.28.81', // linked IP #1
@@ -32,7 +32,7 @@ const DNSProvider nextDnsProvider = DNSProvider(
   ],
   features: ['Custom Blocklists', 'Analytics'],
   description:
-      'NextDNS profile 46bded over Anycast. Use linked IPs for plain DNS; prefer the profile-specific DoH/DoT endpoints for profile settings to apply.',
+      'MyDNS profile 46bded over Anycast. Use linked IPs for plain DNS; prefer the profile-specific DoH/DoT endpoints for profile settings to apply.',
   // canonical DoH endpoint for the profile. If the user configures another profileId at runtime, the app will prefer that.
   doh: 'dns.nextdns.io/46bded',
 );
@@ -74,13 +74,13 @@ const List<DNSProvider> dnsProviders = [
   ),
   // Keep NextDNS in the list (same as nextDnsProvider)
   DNSProvider(
-    name: 'NextDNS',
+    name: 'MyDNS',
     type: 'Plain DNS Anycast',
     dns: ['45.90.28.81', '45.90.30.81'],
     ipv6: ['2a07:a8c0::46:bded', '2a07:a8c1::46:bded'],
     features: ['Custom Blocklists', 'Analytics'],
     description:
-        'NextDNS is a fully-customizable DNS firewall. Configure your blocklists via their web dashboard or API, then route all queries over these anycast servers.',
+        'MyDNS is a fully-customizable DNS firewall. Configure your blocklists via their web dashboard or API, then route all queries over these anycast servers.',
     doh: 'dns.nextdns.io/46bded',
   ),
   DNSProvider(

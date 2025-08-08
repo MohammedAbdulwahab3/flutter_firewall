@@ -1,3 +1,4 @@
+// lib/ui/denylist_page.dart
 import 'package:flutter/material.dart';
 import '../services/nextdns_service.dart';
 import '../services/denylist_local_repo.dart';
@@ -47,25 +48,48 @@ class _DenylistPageState extends State<DenylistPage> {
 
   Future<void> _loadLocalThenRemote() async {
     setState(() => _loading = true);
-    // load local quickly
-    final local = DenylistLocalRepo.instance.getAll();
-    setState(() {
-      _items = local;
-      _filtered = List.from(_items);
-      _loading = false;
-    });
-    // then try remote and replace local if successful
+
+    // 1) Load local cache first
+    try {
+      final local =
+          DenylistLocalRepo.instance
+              .getAll()
+              .map((e) => e.toLowerCase())
+              .toList()
+            ..sort();
+      setState(() {
+        _items = local;
+        _filtered = List.from(_items);
+      });
+    } catch (e) {
+      // ignore local load errors
+    }
+
+    // 2) Then try remote; only overwrite local if remote returns a non-empty list
     try {
       final remote = await NextDnsService.getDenylist(
         profileId: widget.profileId,
         apiKey: widget.apiKey,
       );
-      setState(() {
-        _items = remote;
-        _filtered = List.from(_items);
-      });
+      final normalized = remote.map((e) => e.toLowerCase()).toList()..sort();
+
+      if (normalized.isNotEmpty) {
+        // persist remote into Hive (because it's meaningful)
+        await DenylistLocalRepo.instance.saveAll(normalized);
+        setState(() {
+          _items = normalized;
+          _filtered = List.from(_items);
+        });
+      } else {
+        // remote empty -> do not overwrite local (preserve local user's list)
+        // optionally show a small message:
+        debugPrint('NextDNS returned an empty denylist; keeping local cache.');
+      }
     } catch (e) {
-      // ignore network errors (we already showed local)
+      // network error -> keep local cache
+      debugPrint('Failed to fetch remote denylist: $e');
+    } finally {
+      setState(() => _loading = false);
     }
   }
 
@@ -98,22 +122,47 @@ class _DenylistPageState extends State<DenylistPage> {
   }
 
   Future<void> _addDomain(String domain) async {
+    final normalized = domain.trim().toLowerCase();
+    if (normalized.isEmpty) return;
+
     setState(() => _loading = true);
     try {
-      await NextDnsService.addToDenylist(
+      // Read local Hive list
+      final localSet =
+          DenylistLocalRepo.instance
+              .getAll()
+              .map((e) => e.toLowerCase())
+              .toSet();
+
+      if (localSet.contains(normalized)) {
+        // already present - just update UI
+        final list = localSet.toList()..sort();
+        setState(() {
+          _items = list;
+          _filtered = List.from(_items);
+        });
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('$domain already in denylist')));
+        return;
+      }
+
+      // Add to local set and push full array to NextDNS (setDenylist will update Hive on success)
+      localSet.add(normalized);
+      final merged = localSet.toList()..sort();
+
+      await NextDnsService.setDenylist(
         profileId: widget.profileId,
         apiKey: widget.apiKey,
-        domain: domain,
+        domains: merged,
       );
-      // update local view
-      final updated = await NextDnsService.getDenylist(
-        profileId: widget.profileId,
-        apiKey: widget.apiKey,
-      );
+
+      // setDenylist updates Hive; reflect the merged list in UI
       setState(() {
-        _items = updated;
+        _items = merged;
         _filtered = List.from(_items);
       });
+
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(SnackBar(content: Text('Added $domain')));
@@ -127,21 +176,47 @@ class _DenylistPageState extends State<DenylistPage> {
   }
 
   Future<void> _removeDomain(String domain) async {
+    final normalized = domain.trim().toLowerCase();
+    if (normalized.isEmpty) return;
+
     setState(() => _loading = true);
     try {
-      await NextDnsService.removeFromDenylist(
+      // Read local Hive list
+      final localSet =
+          DenylistLocalRepo.instance
+              .getAll()
+              .map((e) => e.toLowerCase())
+              .toSet();
+
+      if (!localSet.contains(normalized)) {
+        // nothing to remove - update UI from local
+        final list = localSet.toList()..sort();
+        setState(() {
+          _items = list;
+          _filtered = List.from(_items);
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('$domain not found in denylist')),
+        );
+        return;
+      }
+
+      // Remove and push full array to NextDNS (setDenylist will update Hive on success)
+      localSet.remove(normalized);
+      final merged = localSet.toList()..sort();
+
+      await NextDnsService.setDenylist(
         profileId: widget.profileId,
         apiKey: widget.apiKey,
-        domain: domain,
+        domains: merged,
       );
-      final updated = await NextDnsService.getDenylist(
-        profileId: widget.profileId,
-        apiKey: widget.apiKey,
-      );
+
+      // Reflect update in UI
       setState(() {
-        _items = updated;
+        _items = merged;
         _filtered = List.from(_items);
       });
+
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(SnackBar(content: Text('Removed $domain')));
@@ -161,14 +236,32 @@ class _DenylistPageState extends State<DenylistPage> {
         profileId: widget.profileId,
         apiKey: widget.apiKey,
       );
+      // After sync, fetch remote and persist locally (setDenylist already updated local)
       final updated = await NextDnsService.getDenylist(
         profileId: widget.profileId,
         apiKey: widget.apiKey,
       );
-      setState(() {
-        _items = updated;
-        _filtered = List.from(_items);
-      });
+      final normalized = updated.map((e) => e.toLowerCase()).toList()..sort();
+
+      if (normalized.isNotEmpty) {
+        await DenylistLocalRepo.instance.saveAll(normalized);
+        setState(() {
+          _items = normalized;
+          _filtered = List.from(_items);
+        });
+      } else {
+        // nothing on remote after sync - keep local (syncLocalToRemote should have pushed local already)
+        setState(() {
+          _items =
+              DenylistLocalRepo.instance
+                  .getAll()
+                  .map((e) => e.toLowerCase())
+                  .toList()
+                ..sort();
+          _filtered = List.from(_items);
+        });
+      }
+
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(const SnackBar(content: Text('Synced with NextDNS')));
@@ -261,7 +354,11 @@ class _DenylistPageState extends State<DenylistPage> {
                             ),
                             child: ListTile(
                               leading: CircleAvatar(
-                                child: Text(domain[0].toUpperCase()),
+                                child: Text(
+                                  domain.isNotEmpty
+                                      ? domain[0].toUpperCase()
+                                      : '?',
+                                ),
                               ),
                               title: Text(domain),
                               trailing: IconButton(
@@ -295,7 +392,7 @@ class _DenylistPageState extends State<DenylistPage> {
                                                   ),
                                                   onTap: () {
                                                     Navigator.pop(context);
-                                                    // copy to clipboard if you want (Clipboard.setData)
+                                                    // optionally copy to clipboard
                                                   },
                                                 ),
                                               ],
