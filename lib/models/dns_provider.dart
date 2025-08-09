@@ -20,21 +20,21 @@ class DNSProvider {
 
 /// NextDNS profile (example: 46bded)
 const DNSProvider nextDnsProvider = DNSProvider(
-  name: 'MyDNS',
+  name: 'NextDNS',
   type: 'Plain DNS Anycast',
   dns: [
-    '45.90.28.81', // linked IP #1
-    '45.90.30.81', // linked IP #2
+    '45.90.28.125', // linked IP #1
+    '45.90.30.125', // linked IP #2
   ],
   ipv6: [
-    '2a07:a8c0::46:bded', // IPv6 Anycast #1
-    '2a07:a8c1::46:bded', // IPv6 Anycast #2
+    '2a07:a8c0::77:5691', // IPv6 Anycast #1
+    '2a07:a8c1::77:5691', // IPv6 Anycast #2
   ],
   features: ['Custom Blocklists', 'Analytics'],
   description:
       'MyDNS profile 46bded over Anycast. Use linked IPs for plain DNS; prefer the profile-specific DoH/DoT endpoints for profile settings to apply.',
   // canonical DoH endpoint for the profile. If the user configures another profileId at runtime, the app will prefer that.
-  doh: 'dns.nextdns.io/46bded',
+  doh: 'dns.nextdns.io/775691',
 );
 
 const List<DNSProvider> dnsProviders = [
@@ -76,12 +76,12 @@ const List<DNSProvider> dnsProviders = [
   DNSProvider(
     name: 'MyDNS',
     type: 'Plain DNS Anycast',
-    dns: ['45.90.28.81', '45.90.30.81'],
-    ipv6: ['2a07:a8c0::46:bded', '2a07:a8c1::46:bded'],
+    dns: ['45.90.28.125', '45.90.30.125'],
+    ipv6: ['2a07:a8c0::77:5691', '2a07:a8c1::77:5691'],
     features: ['Custom Blocklists', 'Analytics'],
     description:
         'MyDNS is a fully-customizable DNS firewall. Configure your blocklists via their web dashboard or API, then route all queries over these anycast servers.',
-    doh: 'dns.nextdns.io/46bded',
+    doh: 'dns.nextdns.io/775691',
   ),
   DNSProvider(
     name: 'Quad9',

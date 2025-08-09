@@ -1,5 +1,4 @@
 package com.example.dns_changer
-
 import android.app.admin.DeviceAdminReceiver
 import android.content.Context
 import android.content.Intent

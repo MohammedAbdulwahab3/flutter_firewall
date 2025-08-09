@@ -26,21 +26,30 @@ class DnsVpnService : VpnService(), Runnable {
     companion object {
         const val ACTION_START = "com.example.dns_changer.START"
         const val ACTION_STOP  = "com.example.dns_changer.STOP"
+        const val EXTRA_ALLOWED_APPS = "allowedApps"
+        const val EXTRA_BLOCKED_APPS = "blockedApps"
     }
 
-    // configured by Flutter via MethodChannel
-    var upstream1: String = "dns.nextdns.io/46bded"
-    var upstream2: String = ""
+    // configured by Flutter via MethodChannel / MainActivity
+    var upstream1: String = "dns.nextdns.io/775691"
+    var upstream2: String = "https://dns.nextdns.io/775691"
     var port1 = 443
     var port2 = 443
     var queryMethod = ProviderPicker.HTTPS
 
+    // runtime state
     private var descriptor: ParcelFileDescriptor? = null
     private var thread: Thread? = null
     private var provider: Provider? = null
-    internal var interruptFd: ParcelFileDescriptor? = null
     private val running = AtomicBoolean(false)
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    // Keep a reference to the network callback so we can unregister it
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+
+     // NEW: whether to enforce the local/blocklist stored in SharedPreferences.
+     @Volatile
+     var useLocalBlocklist: Boolean = false
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         ensureForeground()
@@ -49,15 +58,29 @@ class DnsVpnService : VpnService(), Runnable {
             ACTION_START -> {
                 intent.getStringExtra("dns1")?.let { upstream1 = it }
                 intent.getStringExtra("dns2")?.let { upstream2 = it }
+
                 try { val qm = intent.getIntExtra("queryMethod", queryMethod); queryMethod = qm } catch (_: Exception) {}
                 try {
                     val p1 = intent.getIntExtra("port1", port1)
                     val p2 = intent.getIntExtra("port2", port2)
                     port1 = p1; port2 = p2
                 } catch (_: Exception) {}
-                startVpn()
+
+                try {
+                    useLocalBlocklist = intent.getBooleanExtra("useLocalBlocklist", false)
+                    Log.i("DnsVpnService", "useLocalBlocklist=$useLocalBlocklist")
+                } catch (_: Exception) {}
+
+
+                Log.i("DnsVpnService", "Received START intent: upstream1=$upstream1 upstream2=$upstream2 queryMethod=$queryMethod")
+                startVpn(intent)
+
+                
             }
             ACTION_STOP -> stopVpn()
+            else -> {
+                Log.i("DnsVpnService", "onStartCommand other action: ${intent?.action}")
+            }
         }
         return START_STICKY
     }
@@ -78,7 +101,7 @@ class DnsVpnService : VpnService(), Runnable {
             val notification = builder
                 .setContentTitle("Shield Guard")
                 .setContentText("VPN running")
-               // .setSmallIcon(android.R.drawable.stat_sys_vpn) // replace with your icon
+                .setSmallIcon(android.R.drawable.sym_def_app_icon)
                 .setOngoing(true)
                 .build()
             startForeground(1, notification)
@@ -87,29 +110,12 @@ class DnsVpnService : VpnService(), Runnable {
         }
     }
 
-    override fun onTaskRemoved(rootIntent: Intent?) {
-        super.onTaskRemoved(rootIntent)
-        try {
-            val restartIntent = Intent(applicationContext, DnsVpnService::class.java).apply {
-                action = ACTION_START
-            }
-            val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_CANCEL_CURRENT else PendingIntent.FLAG_CANCEL_CURRENT
-            val pending = PendingIntent.getService(applicationContext, 0, restartIntent, flags)
-            val am = getSystemService(Context.ALARM_SERVICE) as AlarmManager
-            val triggerAt = System.currentTimeMillis() + 1000L
-            am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pending)
-            Log.i("DnsVpnService", "Scheduled restart after task removed")
-        } catch (ex: Exception) {
-            Log.w("DnsVpnService", "onTaskRemoved schedule restart failed: ${ex.message}")
-        }
-    }
-
     private fun isIpAddress(addr: String?): Boolean {
         if (addr == null) return false
         return Patterns.IP_ADDRESS.matcher(addr).matches()
     }
 
-    private fun startVpn() {
+    private fun startVpn(startIntent: Intent?) {
         if (running.get()) return
 
         val builder = Builder()
@@ -127,32 +133,129 @@ class DnsVpnService : VpnService(), Runnable {
         if (isIpAddress(upstream2) && upstream2 != upstream1) {
             try { builder.addDnsServer(upstream2) } catch (_: Exception) {}
         }
+        Log.i("DnsVpnService", "Starting VPN: method=${queryMethod} upstream1=${upstream1}:${port1} upstream2=${upstream2}:${port2}")
 
-        // IMPORTANT: add default route only if you want device-wide traffic captured
+        // ----- APPLY PER-APP RULES (allowed takes precedence) -----
+        try {
+            val prefs = getSharedPreferences("shieldguard_prefs", Context.MODE_PRIVATE)
+            // Intent extras may include allowed/blocked lists to apply immediately
+            val allowedFromIntent = startIntent?.getStringArrayListExtra(EXTRA_ALLOWED_APPS)
+            val blockedFromIntent = startIntent?.getStringArrayListExtra(EXTRA_BLOCKED_APPS)
+
+            // prefer extras if present, otherwise read persisted sets
+            val allowedSet: Set<String> = when {
+                allowedFromIntent != null && allowedFromIntent.isNotEmpty() -> allowedFromIntent.toSet()
+                else -> prefs.getStringSet("allowed_apps", emptySet()) ?: emptySet()
+            }
+            val blockedSet: Set<String> = when {
+                blockedFromIntent != null && blockedFromIntent.isNotEmpty() -> blockedFromIntent.toSet()
+                else -> prefs.getStringSet("blocked_apps", emptySet()) ?: emptySet()
+            }
+
+            if (allowedSet.isNotEmpty()) {
+                // Allow-mode: only these packages go through VPN
+                for (pkg in allowedSet) {
+                    try {
+                        builder.addAllowedApplication(pkg)
+                        Log.i("DnsVpnService", "addAllowedApplication: $pkg")
+                    } catch (ex: PackageManager.NameNotFoundException) {
+                        Log.w("DnsVpnService", "Package not found for addAllowedApplication: $pkg")
+                    } catch (ex: SecurityException) {
+                        Log.w("DnsVpnService", "addAllowedApplication SecurityException for $pkg: ${ex.message}")
+                    } catch (ex: Exception) {
+                        Log.w("DnsVpnService", "addAllowedApplication failed for $pkg: ${ex.message}")
+                    }
+                }
+            } else if (blockedSet.isNotEmpty()) {
+                // Block-mode: exclude these packages from VPN
+                for (pkg in blockedSet) {
+                    try {
+                        builder.addDisallowedApplication(pkg)
+                        Log.i("DnsVpnService", "addDisallowedApplication: $pkg")
+                    } catch (ex: PackageManager.NameNotFoundException) {
+                        Log.w("DnsVpnService", "Package not found for addDisallowedApplication: $pkg")
+                    } catch (ex: SecurityException) {
+                        Log.w("DnsVpnService", "addDisallowedApplication SecurityException for $pkg: ${ex.message}")
+                    } catch (ex: Exception) {
+                        Log.w("DnsVpnService", "addDisallowedApplication failed for $pkg: ${ex.message}")
+                    }
+                }
+            } else {
+                Log.i("DnsVpnService", "No per-app rules applied (allowed empty && blocked empty)")
+            }
+        } catch (e: Exception) {
+            Log.w("DnsVpnService", "Failed to apply per-app rules: ${e.message}")
+        }
+        // ----- END per-app rules -----
+
+        // NOTE: do NOT add a 0.0.0.0 route here unless you want device-wide capture
         // builder.addRoute("0.0.0.0", 0)
 
         Log.i("DnsVpnService", "Starting VPN: method=${queryMethod} upstream1=${upstream1}:${port1} upstream2=${upstream2}:${port2}")
 
         descriptor?.close()
-        descriptor = builder.establish()
+        descriptor = try {
+            builder.establish()
+        } catch (e: Exception) {
+            Log.e("DnsVpnService", "Failed to establish VPN: ${e.message}")
+            null
+        }
+
         descriptor?.also {
             running.set(true)
             provider = ProviderPicker.get(it, this)
-            provider!!.start()
+            provider?.start()
             thread = Thread(this, "DnsVpnThread").apply { start() }
             registerNetworkCallback()
             Log.i("DnsVpnService", "VPN started")
+        } ?: run {
+            Log.e("DnsVpnService", "descriptor is null - VPN not established")
+        }
+    }
+
+       /**
+     * Helper for providers to read the local blocklist that the Flutter UI pushes into SharedPreferences.
+     * Returns a normalized (lowercase, no trailing dot) set.
+     */
+    fun getLocalBlocklist(): Set<String> {
+        return try {
+            val prefs = getSharedPreferences("shieldguard_prefs", Context.MODE_PRIVATE)
+            val raw = prefs.getStringSet("blocklist_domains", emptySet()) ?: emptySet()
+            raw.map { it.trim().lowercase().trimEnd('.') }.filter { it.isNotEmpty() }.toSet()
+        } catch (e: Exception) {
+            emptySet()
         }
     }
 
     private fun stopVpn() {
         if (!running.get()) return
         running.set(false)
-        provider?.shutdown()
-        descriptor?.close()
-        interruptFd?.close()
-        thread?.interrupt()
+
+        // unregister network callback if any
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            networkCallback?.let { cm.unregisterNetworkCallback(it) }
+            networkCallback = null
+        } catch (e: Exception) {
+            Log.w("DnsVpnService", "unregisterNetworkCallback failed: ${e.message}")
+        }
+
+        try {
+            provider?.shutdown()
+        } catch (e: Exception) {
+            Log.w("DnsVpnService", "provider.shutdown failed: ${e.message}")
+        }
+
+        try { descriptor?.close() } catch (_: Exception) {}
+        try { thread?.interrupt() } catch (_: Exception) {}
+
+        descriptor = null
+        provider = null
+        thread = null
+
         Log.i("DnsVpnService", "VPN stopped")
+        stopForeground(true)
+        stopSelf()
     }
 
     override fun onDestroy() {
@@ -166,11 +269,11 @@ class DnsVpnService : VpnService(), Runnable {
 
     /** Allow provider to resolve via local rules (e.g. blocklist) */
     fun resolveLocal(ip: IpPacket, msg: DnsMessage): Boolean {
-        // TODO: implement rule resolver if you need local answers
+        // TODO: implement rule resolver if you want DNS to be answered locally for some domains
         return false
     }
 
-    /** Protect sockets from VPN */
+    /** Protect sockets from VPN (datagram) */
     override fun protect(socket: DatagramSocket): Boolean = super.protect(socket)
 
     private fun registerNetworkCallback() {
@@ -180,11 +283,10 @@ class DnsVpnService : VpnService(), Runnable {
                 override fun onAvailable(network: android.net.Network) {
                     super.onAvailable(network)
                     Log.i("DnsVpnService", "Network available")
-                    // If provider not running, attempt to restart on main thread (ensure safe access)
                     mainHandler.post {
                         if (!running.get()) {
                             Log.i("DnsVpnService", "Network came back; attempting to restart VPN")
-                            startVpn()
+                            startVpn(null)
                         }
                     }
                 }
@@ -194,6 +296,7 @@ class DnsVpnService : VpnService(), Runnable {
                 }
             }
             cm.registerDefaultNetworkCallback(nc)
+            networkCallback = nc
         } catch (ex: Exception) {
             Log.w("DnsVpnService", "registerNetworkCallback failed: ${ex.message}")
         }

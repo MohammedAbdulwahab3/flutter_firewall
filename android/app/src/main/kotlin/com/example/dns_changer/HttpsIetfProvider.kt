@@ -20,6 +20,8 @@ import java.io.FileDescriptor
 import java.util.*
 import java.util.concurrent.TimeUnit
 import javax.net.SocketFactory
+import com.example.dns_changer.provider.ProtectedSocketFactory
+
 
 class HttpsIetfProvider(
     descriptor: ParcelFileDescriptor,

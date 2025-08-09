@@ -23,6 +23,7 @@ import java.net.InetAddress
 import java.util.*
 import java.util.concurrent.TimeUnit
 import javax.net.SocketFactory
+import com.example.dns_changer.provider.ProtectedSocketFactory
 
 class HttpsJsonProvider(
     descriptor: ParcelFileDescriptor,
@@ -36,6 +37,7 @@ class HttpsJsonProvider(
     private val whqList = WhqList()
 
     private val httpClient: OkHttpClient by lazy {
+    
         val protectedSocketFactory = ProtectedSocketFactory(SocketFactory.getDefault(), service)
         OkHttpClient.Builder()
             .socketFactory(protectedSocketFactory)

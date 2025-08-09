@@ -1,3 +1,4 @@
+
 package com.example.dns_changer.provider
 
 import android.os.ParcelFileDescriptor
@@ -56,13 +57,49 @@ abstract class Provider(
     // ---------------------------
     // Simple blocklist logic (example)
     // ---------------------------
-    private val blocked = setOf("xvideos.com", "pornhub.com")
+      // ---------------------------
+    // Blocklist logic (improved)
+    // ---------------------------
+    private val builtinBlocked = setOf("xvideos.com", "pornhub.com")
 
     fun shouldBlock(dnsMsg: DnsMessage): Boolean {
         val q = dnsMsg.question?.name?.toString() ?: return false
         val host = q.trimEnd('.').lowercase()
-        return blocked.any { host == it || host.endsWith(".$it") }
+
+        return try {
+            // If the VPN session explicitly requested local blocklist enforcement, use that list
+            if ((service.useLocalBlocklist)) {
+                val set = service.getLocalBlocklist()
+                if (set.isEmpty()) return false
+                // Fast path: exact match
+                if (set.contains(host)) return true
+                // Check suffix / subdomain matches and wildcard-ish entries
+                for (entry in set) {
+                    if (entry.isEmpty()) continue
+                    if (entry.startsWith("*")) {
+                        // wildcard like *.example.com -> check suffix after *
+                        val suffix = entry.removePrefix("*").trimStart('.')
+                        if (host == suffix || host.endsWith(".$suffix")) return true
+                    } else if (entry.startsWith(".")) {
+                        // leading-dot: match suffix
+                        val suffix = entry.trimStart('.')
+                        if (host == suffix || host.endsWith(".$suffix")) return true
+                    } else {
+                        // normal: exact or subdomain match
+                        if (host == entry || host.endsWith(".$entry")) return true
+                    }
+                }
+                return false
+            } else {
+                // fallback to builtin list (preserve previous behavior)
+                return builtinBlocked.any { host == it || host.endsWith(".$it") }
+            }
+        } catch (e: Exception) {
+            // safe default: do not block on error
+            false
+        }
     }
+
 /**
  * Return true if there are queued writes waiting to be written to the TUN device.
  * Used by providers so they can request POLLOUT when polling the TUN fd.
@@ -114,3 +151,22 @@ abstract class Provider(
         }
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

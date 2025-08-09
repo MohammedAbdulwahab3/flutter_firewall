@@ -1,4 +1,3 @@
-
 package com.example.dns_changer.provider
 
 import android.os.ParcelFileDescriptor
